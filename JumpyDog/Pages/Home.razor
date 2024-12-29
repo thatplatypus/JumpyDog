@@ -1,0 +1,338 @@
+﻿@page "/"
+@inject IJSRuntime JSRuntime
+@inject IWebAssemblyHostEnvironment Host
+@using SkiaSharp
+@using SkiaSharp.Views.Blazor
+@using System.Timers
+@using Microsoft.AspNetCore.Components.WebAssembly.Hosting
+
+
+
+<div id="game-container" tabindex="0" @onkeydown="HandleKeyDown" class="container d-flex flex-column align-items-center justify-content-center dvh-100" style="min-width:100vw;">
+    <SKCanvasView id="game-canvas" OnPaintSurface="OnPaintSurface" EnableRenderLoop="true" class="d-flex position-relative" style="@($"max-height: {_height}px; max-width: {_width}px;scale:1.5;border-radius:1em;box-shadow: 0px 0px 12px 1px white;")"/>
+    <button class="btn btn-primary w-25" @onclick="HandleJumpClick" style="margin-top:4rem;">Jump</button>
+    <p class="mt-4 text-muted">Use Spacebar or Button to Jump! Avoid the obstacles!</p>
+</div>
+
+<script>
+    window.getScreenWidth = () => window.innerWidth;
+
+    const canvases = document.querySelectorAll('canvas');
+    let canvas;
+
+    // Loop through canvases and remove the ones without the ID 'game-canvas'
+    canvases.forEach((c) => {
+        if (c.id !== 'game-canvas') {
+            canvas = c;
+        }
+    });
+    
+    window.startGame = () => {
+        canvas.style.transition = 'opacity 1s';
+        canvas.style.opacity = '0';
+
+        const container = document.getElementById("game-container");
+        if (container && !container.classList.contains("background"))
+            container.classList.add("background");
+
+        setTimeout(() => {
+            canvas.style.display = 'none'; 
+            canvas.remove();
+           
+        }, 1000);
+        
+        return true;
+    }
+
+</script>
+
+@code {
+        private Timer _gameTimer;
+    private bool _isPlaying = false;
+
+    private bool _initialized = false;
+
+    private int _width = 600;
+    private int _height = 200;
+
+    private float _dogY = 200; // Initial vertical position of the dog
+    private float _velocity = 0; // Dog's velocity
+    private const float Gravity = 0.5f; // Gravity force
+    private int _score = 0;
+    private SKBitmap _dogImage;
+
+    private List<Obstacle> _obstacles = new();
+    private float _obstacleSpeed = 2; // Speed of obstacles
+    private Random _random = new();
+    private SKCanvasView _canvas;
+
+    protected override void OnInitialized()
+    {
+        _gameTimer = new Timer(1000.0 / 60); // 60 FPS
+        _gameTimer.Elapsed += (s, e) => InvokeAsync(() =>
+        {
+            if (_isPlaying)
+            {
+                UpdateGame();
+                StateHasChanged();
+            }
+        });
+        _gameTimer.Start();
+        StateHasChanged();
+    }
+
+ 
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var httpClient = new HttpClient();
+            await using var stream = await httpClient.GetStreamAsync(Host.IsProduction() ? "https://jumpy-dog.azurewebsites.net/dog-1.png" : "https://localhost:7028/dog-1.png");
+            _dogImage = SKBitmap.Decode(stream);
+            await UpdateCanvasDimensions();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex.Message);
+        }
+    }
+    
+    private async Task UpdateCanvasDimensions()
+    {
+        try
+        {
+            var screenWidth = await JSRuntime.InvokeAsync<int>("getScreenWidth");
+            if (screenWidth < 768)
+            {
+                _width = 300;
+                _height = 150;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex.Message);
+        }
+
+        StateHasChanged();
+    }
+
+    private async Task StartGame()
+    {
+        Console.WriteLine("Starting game");
+
+        try
+        {
+            _initialized = await JSRuntime.InvokeAsync<bool>("startGame");
+        }
+        catch
+        {
+            _initialized = true;
+        }
+
+        _isPlaying = true;
+        _score = 0;
+        _dogY = 200; // Reset dog position
+        _velocity = 0; // Reset velocity
+        _obstacles.Clear(); // Clear existing obstacles
+        _obstacles.Add(CreateObstacle(800)); // Add the first obstacle
+        StateHasChanged();
+    }
+    
+    private async Task HandleJumpClick()
+    {
+        Console.WriteLine("button clicked");
+        if (_isPlaying)
+        {
+            _velocity = -7; // Jump strength
+        }
+        else
+        {
+           await StartGame();
+        }
+    }
+
+    private void UpdateGame()
+    {
+        // Update dog position
+        _velocity += Gravity;
+
+        // Stop downward movement when on the ground
+        if (_dogY + 20 + _velocity >= 350) // Ground level (350), dog radius (20)
+        {
+            _dogY = 330; // Adjust Y position to "stand" on the ground
+            _velocity = 0; // Stop falling
+        }
+        else
+        {
+            _dogY += _velocity; // Allow free fall
+        }
+
+        // Move obstacles
+        foreach (var obstacle in _obstacles)
+        {
+            obstacle.Move(-_obstacleSpeed);
+        }
+
+        // Remove off-screen obstacles
+        _obstacles.RemoveAll(o => o.IsOffScreen());
+
+        // Add new obstacles
+        if (_obstacles.Count == 0 || _obstacles[^1].Top.Right < 600)
+        {
+            _obstacles.Add(CreateObstacle(800));
+        }
+
+        // Update score
+        foreach (var obstacle in _obstacles)
+        {
+            if (!obstacle.Scored && obstacle.Top.Right < 100)
+            {
+                _score++;
+                obstacle.Scored = true;
+            }
+        }
+
+        CheckCollisions();
+    }
+
+    private Obstacle CreateObstacle(float x)
+    {
+        var gapY = _random.Next(100, 250); // Random gap position
+        var gapHeight = 150; // Height of the gap
+
+        var topPipe = new SKRect(x, 0, x + 50, gapY);
+        var bottomPipe = new SKRect(x, gapY + gapHeight, x + 50, 350);
+
+        return new Obstacle(topPipe, bottomPipe);
+    }
+
+    
+    private void OnPaintSurface(SKPaintSurfaceEventArgs e)
+{
+    var canvas = e.Surface.Canvas;
+    canvas.Clear(SKColors.SkyBlue);
+
+    if (!_initialized)
+    {
+        // Splash screen design
+        using (var paint = new SKPaint
+               {
+                   Color = SKColors.DarkSlateBlue,
+                   TextSize = 64,
+                   IsAntialias = true,
+                   Typeface = SKTypeface.FromFamilyName("Comic Sans MS", SKFontStyle.Bold) // Use a fun font
+               })
+        {
+            canvas.DrawText("Jumpy Dog", 100, 200, paint); // Centered title
+        }
+
+        using (var paint = new SKPaint
+               {
+                   Color = SKColors.Black,
+                   TextSize = 24,
+                   IsAntialias = true
+               })
+        {
+            canvas.DrawText("Press Space to Start!", 130, 260, paint); // Smaller subtitle
+        }
+
+        return; // Early exit to skip rendering the game
+    }
+
+    // Game rendering logic (if initialized)
+    canvas.Clear(SKColors.SkyBlue);
+
+    // Draw ground
+    using (var paint = new SKPaint { Color = SKColors.ForestGreen })
+    {
+        canvas.DrawRect(0, 350, 800, 50, paint);
+    }
+
+    // Draw obstacles
+    using (var paint = new SKPaint { Color = SKColors.DarkOliveGreen })
+    {
+        foreach (var obstacle in _obstacles)
+        {
+            canvas.DrawRect(obstacle.Top, paint);
+            canvas.DrawRect(obstacle.Bottom, paint);
+        }
+    }
+
+    // Draw dog image
+    if (_dogImage != null)
+    {
+        float x = 80; // X-position of the dog
+        float y = _dogY - (_dogImage.Height / 2); // Center the dog vertically
+        float size = 48;
+        canvas.DrawBitmap(_dogImage, new SKRect(x, y, x + _dogImage.Width, y + _dogImage.Height));
+    }
+
+    // Draw score
+    using (var paint = new SKPaint
+           {
+               Color = SKColors.Black,
+               TextSize = 24,
+               IsAntialias = true
+           })
+    {
+        canvas.DrawText($"Score: {_score}", 10, 30, paint);
+    }
+
+    if (!_isPlaying)
+    {
+        using (var paint = new SKPaint
+               {
+                   Color = SKColors.Red,
+                   TextSize = 48,
+                   IsAntialias = true
+               })
+        {
+            canvas.DrawText("Game Over", 300, 200, paint);
+        }
+    }
+}
+    
+    private void CheckCollisions()
+    {
+        // Check obstacle collisions only
+        foreach (var obstacle in _obstacles)
+        {
+            if (IntersectsWithCircle(obstacle.Top) || IntersectsWithCircle(obstacle.Bottom))
+            {
+                GameOver();
+            }
+        }
+    }
+
+    private bool IntersectsWithCircle(SKRect rect)
+    {
+        float cx = 100, cy = _dogY; // Circle center (dog's position)
+        float radius = 20; // Dog's radius
+
+        float nearestX = Math.Max(rect.Left, Math.Min(cx, rect.Right));
+        float nearestY = Math.Max(rect.Top, Math.Min(cy, rect.Bottom));
+
+        float deltaX = cx - nearestX;
+        float deltaY = cy - nearestY;
+
+        return (deltaX * deltaX + deltaY * deltaY) < (radius * radius);
+    }
+
+    private void GameOver()
+    {
+        _isPlaying = false;
+        Console.WriteLine("Game Over!");
+    }
+    
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Code == "Space" && _isPlaying)
+        {
+                _velocity = -7; // Jump strength
+        }
+        else if (e.Code == "Space" && !_isPlaying)
+        {
+            await StartGame();
+        }
+    }
+}
